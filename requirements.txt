@@ -1,5 +1,7 @@
-numpy
+fastapi
+uvicorn
 requests
-websockets
+numpy
 scikit-learn
-flask
+websockets
+python-dotenv
