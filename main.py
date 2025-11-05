@@ -187,13 +187,18 @@ async def monitor_ema(symbol, interval):
             continue
 
         prob = predict_trend(model, closes, volumes)
+        if prob is None:
+            prev_ema9, prev_ema26 = ema9, ema26
+            continue  # Skip until we have valid prediction
+
         next_trend = predict_next_5_candles(model, closes.copy(), volumes.copy())
         vol = estimate_volatility(closes)
 
         # High-confidence, high-profit signals
         def high_conf_signal(direction):
-            expected_move = vol * (prob if direction == "up" else 1 - prob) * 20 * 100  # leverage 20x, % scale
+            expected_move = vol * ((prob if direction == "up" else (1 - prob))) * 20 * 100  # leverage 20x
             return prob >= MIN_PROBABILITY and expected_move >= TARGET_PROFIT_PERCENT
+
 
         if prev_ema9 < prev_ema26 and ema9 >= ema26 and high_conf_signal("up"):
             msg = f"📈 {symbol} ({interval}) EMA9 crossed ABOVE EMA26 — BUY 💰\nPrice: {close_price}"
