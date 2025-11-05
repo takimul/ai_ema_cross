@@ -1055,6 +1055,11 @@ async def monitor_ema(symbol, interval):
         prev_ema9, prev_ema26 = ema9, ema26
 
 # ---------------- Telegram Webhook ----------------
+def send_telegram(chat_id, msg):
+    if BOT_TOKEN:
+        print(f"[Telegram would send to {chat_id}]: {msg}")
+
+user_ids = set()
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
     if token != BOT_TOKEN:
