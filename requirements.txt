@@ -3,5 +3,7 @@ uvicorn
 requests
 numpy
 scikit-learn
-websockets
+xgboost
+joblib
 python-dotenv
+
