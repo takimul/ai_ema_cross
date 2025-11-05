@@ -240,8 +240,21 @@ async def monitor_ema(symbol, interval):
 # ---------------- Telegram Webhook ----------------
 
 def send_telegram(chat_id, msg):
-    if BOT_TOKEN:
-        print(f"[Telegram would send to {chat_id}]: {msg}")
+    if not BOT_TOKEN:
+        print("❌ Missing BOT_TOKEN environment variable.")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": msg,
+        "parse_mode": "Markdown"
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[Telegram Error]: {e}")
+
 
 def broadcast(msg):
     for chat_id in user_ids:
