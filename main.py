@@ -129,7 +129,7 @@
 #         for tf in TIMEFRAMES:
 #             asyncio.create_task(monitor_ema(symbol, tf))
 
-
+# working but too many signal
 # main.py
 import os
 import time
@@ -316,6 +316,70 @@ def predict_probability_from_model(model, scaler, recent_window: List[float]) ->
 
 
 # ---------------- Crossover detection & alert ----------------
+# def detect_and_alert_cross(symbol: str, interval: str, close_time_ms: int):
+#     try:
+#         klines = fetch_klines(symbol, interval, limit=HISTORICAL_CANDLES)
+#         if not klines:
+#             return
+#         closes = closes_from_klines(klines)
+#         idx = None
+#         for i, k in enumerate(klines):
+#             if int(k[6]) == close_time_ms:
+#                 idx = i
+#                 break
+#         if idx is None:
+#             idx = len(closes) - 1
+#         if idx < 1:
+#             return
+
+#         prev = closes[:idx]
+#         cur = closes[:idx + 1]
+#         if len(prev) < 26 or len(cur) < 26:
+#             return
+
+#         prev_ema9 = get_ema(prev, 9)
+#         prev_ema26 = get_ema(prev, 26)
+#         ema9 = get_ema(cur, 9)
+#         ema26 = get_ema(cur, 26)
+#         if prev_ema9 is None or prev_ema26 is None or ema9 is None or ema26 is None:
+#             return
+
+#         bullish = (prev_ema9 < prev_ema26) and (ema9 >= ema26)
+#         bearish = (prev_ema9 > prev_ema26) and (ema9 <= ema26)
+#         if not bullish and not bearish:
+#             return
+
+#         key = (symbol, interval, close_time_ms)
+#         if key in sent_signals:
+#             return
+
+#         # Use trained model if available
+#         model_info = ML_MODELS.get(symbol)
+#         prob = None
+#         if model_info is not None:
+#             model, scaler, score, trained_at = model_info
+#             prob = predict_probability_from_model(model, scaler, cur[-TRAIN_WINDOW:] if len(cur) >= TRAIN_WINDOW else cur)
+
+#         price = cur[-1]
+#         if bullish:
+#             msg = f"📈 {symbol} ({interval}) EMA9 CROSSED ABOVE EMA26 — BUY\nPrice: {price}"
+#             if prob is not None:
+#                 msg += f"\n🤖 AI Up Probability: {prob}%  (model score: {round(score,3)})"
+#             broadcast(msg)
+#             sent_signals.add(key)
+#             print("[ALERT]", msg)
+#         else:
+#             msg = f"📉 {symbol} ({interval}) EMA9 CROSSED BELOW EMA26 — SELL\nPrice: {price}"
+#             if prob is not None:
+#                 msg += f"\n🤖 AI Down Probability: {round(100-prob,2)}%  (model score: {round(score,3)})"
+#             broadcast(msg)
+#             sent_signals.add(key)
+#             print("[ALERT]", msg)
+
+#     except Exception as e:
+#         print("detect_and_alert_cross error:", e)
+
+# for fewr msg
 def detect_and_alert_cross(symbol: str, interval: str, close_time_ms: int):
     try:
         klines = fetch_klines(symbol, interval, limit=HISTORICAL_CANDLES)
@@ -353,32 +417,43 @@ def detect_and_alert_cross(symbol: str, interval: str, close_time_ms: int):
         if key in sent_signals:
             return
 
-        # Use trained model if available
         model_info = ML_MODELS.get(symbol)
         prob = None
         if model_info is not None:
             model, scaler, score, trained_at = model_info
-            prob = predict_probability_from_model(model, scaler, cur[-TRAIN_WINDOW:] if len(cur) >= TRAIN_WINDOW else cur)
+            prob = predict_probability_from_model(
+                model, scaler, cur[-TRAIN_WINDOW:] if len(cur) >= TRAIN_WINDOW else cur
+            )
 
         price = cur[-1]
+
+        # Only send if probability confidence > 60%
+        if prob is not None and prob < 60:
+            print(f"[SKIP] {symbol} {interval} signal ignored (low confidence {prob}%)")
+            return
+
+        # Create message
         if bullish:
-            msg = f"📈 {symbol} ({interval}) EMA9 CROSSED ABOVE EMA26 — BUY\nPrice: {price}"
+            msg = (
+                f"📈 {symbol} ({interval}) EMA9 crossed above EMA26 — **BUY**\n"
+                f"💰 Price: {price}\n"
+            )
             if prob is not None:
-                msg += f"\n🤖 AI Up Probability: {prob}%  (model score: {round(score,3)})"
-            broadcast(msg)
-            sent_signals.add(key)
-            print("[ALERT]", msg)
+                msg += f"🤖 AI Confidence (Up): {prob}%  | Model score: {round(score,3)}"
         else:
-            msg = f"📉 {symbol} ({interval}) EMA9 CROSSED BELOW EMA26 — SELL\nPrice: {price}"
+            msg = (
+                f"📉 {symbol} ({interval}) EMA9 crossed below EMA26 — **SELL**\n"
+                f"💰 Price: {price}\n"
+            )
             if prob is not None:
-                msg += f"\n🤖 AI Down Probability: {round(100-prob,2)}%  (model score: {round(score,3)})"
-            broadcast(msg)
-            sent_signals.add(key)
-            print("[ALERT]", msg)
+                msg += f"🤖 AI Confidence (Down): {round(100-prob,2)}%  | Model score: {round(score,3)}"
+
+        broadcast(msg)
+        sent_signals.add(key)
+        print("[ALERT]", msg)
 
     except Exception as e:
         print("detect_and_alert_cross error:", e)
-
 
 # ---------------- Monitors (no startup backfill for cross signals) ----------------
 async def monitor_interval(interval: str):
