@@ -308,7 +308,7 @@ app = FastAPI()
 
 # =================== CONFIG ===================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SYMBOLS = ["OPUSDT", "RENDERUSDT", "BTCUSDT"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "OPUSDT"]
 API_URL = "https://api.binance.com/api/v3/klines"
 MODEL_PATH = "models"
 os.makedirs(MODEL_PATH, exist_ok=True)
@@ -340,9 +340,13 @@ def fetch_candles(symbol, interval="5m", limit=500):
 
 # =================== INDICATORS ===================
 def get_ema(prices, period):
+    if len(prices) < period:
+        return np.array([])
     return np.convolve(prices, np.ones(period)/period, mode='valid')
 
 def get_rsi(prices, period=14):
+    if len(prices) <= period:
+        return np.array([])
     deltas = np.diff(prices)
     gain = np.where(deltas > 0, deltas, 0)
     loss = np.where(deltas < 0, -deltas, 0)
@@ -355,9 +359,18 @@ def compute_features(closes, volumes):
     ema_fast = get_ema(closes, 12)
     ema_slow = get_ema(closes, 26)
     rsi = get_rsi(closes)
-    if len(rsi) < len(ema_slow):
-        rsi = np.pad(rsi, (len(ema_slow)-len(rsi), 0), 'edge')
-    features = np.column_stack([ema_fast[-len(ema_slow):], ema_slow, rsi, volumes[-len(ema_slow):]])
+
+    # Align all feature lengths
+    min_len = min(len(ema_fast), len(ema_slow), len(rsi), len(volumes))
+    if min_len == 0:
+        raise ValueError("Not enough data for feature computation.")
+
+    ema_fast = ema_fast[-min_len:]
+    ema_slow = ema_slow[-min_len:]
+    rsi = rsi[-min_len:]
+    volumes = volumes[-min_len:]
+
+    features = np.column_stack([ema_fast, ema_slow, rsi, volumes])
     return features
 
 # =================== MODEL TRAINING ===================
@@ -410,20 +423,27 @@ async def monitor_ema():
             if model is None or (symbol not in last_trained or datetime.utcnow() - last_trained[symbol] > timedelta(hours=4)):
                 model = train_ml_model(symbol, closes, volumes)
 
-            prob = predict_signal(model, closes, volumes)
-            trend = "📈 Bullish" if prob > 0.5 else "📉 Bearish"
-            chance = round(prob * 100, 2)
+            if model is None:
+                continue
 
-            if chance >= 10:  # Only send signals with ≥10% profit probability
-                msg = (
-                    f"📊 *{symbol}*\n"
-                    f"Trend: {trend}\n"
-                    f"Probability: {chance}%\n"
-                    f"Prediction: {'Up' if prob > 0.5 else 'Down'} in next 5 candles.\n"
-                    f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-                )
-                for uid in user_ids:
-                    send_telegram(uid, msg)
+            try:
+                prob = predict_signal(model, closes, volumes)
+                trend = "📈 Bullish" if prob > 0.5 else "📉 Bearish"
+                chance = round(prob * 100, 2)
+
+                if chance >= 10:
+                    msg = (
+                        f"📊 *{symbol}*\n"
+                        f"Trend: {trend}\n"
+                        f"Probability: {chance}%\n"
+                        f"Prediction: {'Up' if prob > 0.5 else 'Down'} in next 5 candles.\n"
+                        f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                    )
+                    for uid in user_ids:
+                        send_telegram(uid, msg)
+
+            except Exception as e:
+                print(f"Prediction failed for {symbol}: {e}")
 
             await asyncio.sleep(2)
 
