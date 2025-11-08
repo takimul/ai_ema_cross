@@ -316,62 +316,23 @@ def predict_signal(model, closes, volumes):
     return prob
 
 # =================== FEEDBACK SYSTEM ===================
-# def log_prediction(symbol, direction, price, prob):
-#     prediction_log.append({
-#         "symbol": symbol,
-#         "timestamp": datetime.utcnow().isoformat(),
-#         "direction": direction,
-#         "price": price,
-#         "prob": prob,
-#         "checked": False
-#     })
-#     save_json(PRED_LOG_PATH, prediction_log)
+def log_prediction(symbol, direction, price, prob):
+    prediction_log.append({
+        "symbol": symbol,
+        "timestamp": datetime.utcnow().isoformat(),
+        "direction": direction,
+        "price": price,
+        "prob": prob,
+        "checked": False
+    })
+    save_json(PRED_LOG_PATH, prediction_log)
 
-# def evaluate_feedback():
-#     now = datetime.utcnow()
-#     new_feedbacks = 0
-
-#     for pred in prediction_log:
-#         if pred["checked"]:
-#             continue
-
-#         pred_time = datetime.fromisoformat(pred["timestamp"])
-#         if (now - pred_time) < timedelta(minutes=15):  # wait 3 candles (5m each)
-#             continue
-
-#         closes, _ = fetch_candles(pred["symbol"], limit=5)
-#         if len(closes) == 0:
-#             continue
-
-#         current_price = closes[-1]
-#         change_pct = ((current_price - pred["price"]) / pred["price"]) * 100
-
-#         correct = (
-#             (pred["direction"] == "bullish" and change_pct >= 10) or
-#             (pred["direction"] == "bearish" and change_pct <= -10)
-#         )
-
-#         feedback_log.append({
-#             "symbol": pred["symbol"],
-#             "timestamp": pred["timestamp"],
-#             "direction": pred["direction"],
-#             "price_change_pct": round(change_pct, 2),
-#             "outcome": "correct" if correct else "wrong"
-#         })
-
-#         pred["checked"] = True
-#         new_feedbacks += 1
-
-#     if new_feedbacks > 0:
-#         save_json(FEED_LOG_PATH, feedback_log)
-#         save_json(PRED_LOG_PATH, prediction_log)
-#         print(f"✅ Evaluated {new_feedbacks} past predictions.")
 def evaluate_feedback():
     now = datetime.utcnow()
     new_feedbacks = 0
 
     for pred in prediction_log:
-        if pred.get("checked"):
+        if pred["checked"]:
             continue
 
         pred_time = datetime.fromisoformat(pred["timestamp"])
@@ -385,45 +346,18 @@ def evaluate_feedback():
         current_price = closes[-1]
         change_pct = ((current_price - pred["price"]) / pred["price"]) * 100
 
-        # Determine if signal was correct
         correct = (
             (pred["direction"] == "bullish" and change_pct >= 10) or
             (pred["direction"] == "bearish" and change_pct <= -10)
         )
 
-        outcome = "correct" if correct else "wrong"
-        reason = ""
-
-        if correct and pred["direction"] == "bullish":
-            reason = f"✅ Bullish call was correct — price rose {change_pct:.2f}% in 15m."
-        elif correct and pred["direction"] == "bearish":
-            reason = f"✅ Bearish call was correct — price dropped {abs(change_pct):.2f}% in 15m."
-        elif not correct and pred["direction"] == "bullish":
-            reason = f"❌ Bullish call was wrong — price actually fell {abs(change_pct):.2f}%."
-        elif not correct and pred["direction"] == "bearish":
-            reason = f"❌ Bearish call was wrong — price actually rose {abs(change_pct):.2f}%."
-
-        # Record feedback
         feedback_log.append({
             "symbol": pred["symbol"],
             "timestamp": pred["timestamp"],
             "direction": pred["direction"],
             "price_change_pct": round(change_pct, 2),
-            "outcome": outcome,
-            "reason": reason
+            "outcome": "correct" if correct else "wrong"
         })
-
-        # Send result message to users
-        msg = (
-            f"📈 *Signal Review*\n"
-            f"Symbol: *{pred['symbol']}*\n"
-            f"Direction: {pred['direction'].capitalize()}\n"
-            f"Result: {'✅ Correct' if correct else '❌ Wrong'}\n"
-            f"{reason}\n"
-            f"⏰ Checked at {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-        )
-        for uid in user_ids:
-            send_telegram(uid, msg)
 
         pred["checked"] = True
         new_feedbacks += 1
@@ -431,7 +365,73 @@ def evaluate_feedback():
     if new_feedbacks > 0:
         save_json(FEED_LOG_PATH, feedback_log)
         save_json(PRED_LOG_PATH, prediction_log)
-        print(f"✅ Evaluated {new_feedbacks} past predictions and sent results.")
+        print(f"✅ Evaluated {new_feedbacks} past predictions.")
+# def evaluate_feedback():
+#     now = datetime.utcnow()
+#     new_feedbacks = 0
+
+#     for pred in prediction_log:
+#         if pred.get("checked"):
+#             continue
+
+#         pred_time = datetime.fromisoformat(pred["timestamp"])
+#         if (now - pred_time) < timedelta(minutes=15):  # wait 3 candles (5m each)
+#             continue
+
+#         closes, _ = fetch_candles(pred["symbol"], limit=5)
+#         if len(closes) == 0:
+#             continue
+
+#         current_price = closes[-1]
+#         change_pct = ((current_price - pred["price"]) / pred["price"]) * 100
+
+#         # Determine if signal was correct
+#         correct = (
+#             (pred["direction"] == "bullish" and change_pct >= 10) or
+#             (pred["direction"] == "bearish" and change_pct <= -10)
+#         )
+
+#         outcome = "correct" if correct else "wrong"
+#         reason = ""
+
+#         if correct and pred["direction"] == "bullish":
+#             reason = f"✅ Bullish call was correct — price rose {change_pct:.2f}% in 15m."
+#         elif correct and pred["direction"] == "bearish":
+#             reason = f"✅ Bearish call was correct — price dropped {abs(change_pct):.2f}% in 15m."
+#         elif not correct and pred["direction"] == "bullish":
+#             reason = f"❌ Bullish call was wrong — price actually fell {abs(change_pct):.2f}%."
+#         elif not correct and pred["direction"] == "bearish":
+#             reason = f"❌ Bearish call was wrong — price actually rose {abs(change_pct):.2f}%."
+
+#         # Record feedback
+#         feedback_log.append({
+#             "symbol": pred["symbol"],
+#             "timestamp": pred["timestamp"],
+#             "direction": pred["direction"],
+#             "price_change_pct": round(change_pct, 2),
+#             "outcome": outcome,
+#             "reason": reason
+#         })
+
+#         # Send result message to users
+#         msg = (
+#             f"📈 *Signal Review*\n"
+#             f"Symbol: *{pred['symbol']}*\n"
+#             f"Direction: {pred['direction'].capitalize()}\n"
+#             f"Result: {'✅ Correct' if correct else '❌ Wrong'}\n"
+#             f"{reason}\n"
+#             f"⏰ Checked at {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+#         )
+#         for uid in user_ids:
+#             send_telegram(uid, msg)
+
+#         pred["checked"] = True
+#         new_feedbacks += 1
+
+#     if new_feedbacks > 0:
+#         save_json(FEED_LOG_PATH, feedback_log)
+#         save_json(PRED_LOG_PATH, prediction_log)
+#         print(f"✅ Evaluated {new_feedbacks} past predictions and sent results.")
 
 
 def recent_accuracy(symbol, window=10):
