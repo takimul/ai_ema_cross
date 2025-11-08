@@ -308,7 +308,7 @@ app = FastAPI()
 
 # =================== CONFIG ===================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "OPUSDT"]
+SYMBOLS = ["BTCUSDT", "ONDOUSDT", "OPUSDT"]
 API_URL = "https://api.binance.com/api/v3/klines"
 MODEL_PATH = "models"
 os.makedirs(MODEL_PATH, exist_ok=True)
@@ -431,7 +431,7 @@ async def monitor_ema():
                 trend = "📈 Bullish" if prob > 0.5 else "📉 Bearish"
                 chance = round(prob * 100, 2)
 
-                if chance >= 10:
+                if chance >= 60:
                     msg = (
                         f"📊 *{symbol}*\n"
                         f"Trend: {trend}\n"
