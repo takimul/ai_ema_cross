@@ -182,334 +182,107 @@
 # test
 
 import os
-import time
 import json
-import asyncio
 import requests
+import asyncio
 import numpy as np
-import joblib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+import xgboost as xgb
+from sklearn.preprocessing import StandardScaler
+
+# ---------------- Config ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SYMBOLS = ["OPUSDT", "RENDERUSDT", "BTCUSDT"]
+TIMEFRAMES = ["5m", "15m"]
+
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 app = FastAPI()
-
-# =================== CONFIG ===================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-SYMBOLS = ["BTCUSDT", "ONDOUSDT", "OPUSDT"]
-API_URL = "https://api.binance.com/api/v3/klines"
-MODEL_PATH = "models"
-os.makedirs(MODEL_PATH, exist_ok=True)
-
-PRED_LOG_PATH = "prediction_log.json"
-FEED_LOG_PATH = "feedback_log.json"
-
 user_ids = set()
-last_trained = {}
-model_cache = {}
+sent_hourly = set()
+open_signals = {}  # track open trades for accuracy eval
 
-# =================== HELPERS ===================
-def load_json(path):
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
-    return []
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-prediction_log = load_json(PRED_LOG_PATH)
-feedback_log = load_json(FEED_LOG_PATH)
-
-# =================== TELEGRAM ===================
-def send_telegram(chat_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"Telegram error: {e}")
-
-# =================== DATA FETCH ===================
-def fetch_candles(symbol, interval="5m", limit=500):
-    try:
-        url = f"{API_URL}?symbol={symbol}&interval={interval}&limit={limit}"
-        data = requests.get(url).json()
-        closes = [float(x[4]) for x in data]
-        volumes = [float(x[5]) for x in data]
-        return np.array(closes), np.array(volumes)
-    except Exception as e:
-        print(f"Error fetching data: {e}")
-        return np.array([]), np.array([])
-
-# =================== INDICATORS ===================
-def get_ema(prices, period):
-    if len(prices) < period:
-        return np.array([])
-    return np.convolve(prices, np.ones(period)/period, mode='valid')
-
-def get_rsi(prices, period=14):
-    if len(prices) <= period:
-        return np.array([])
-    deltas = np.diff(prices)
-    gain = np.where(deltas > 0, deltas, 0)
-    loss = np.where(deltas < 0, -deltas, 0)
-    avg_gain = np.convolve(gain, np.ones(period)/period, mode='valid')
-    avg_loss = np.convolve(loss, np.ones(period)/period, mode='valid')
-    rs = avg_gain / (avg_loss + 1e-10)
-    return 100 - (100 / (1 + rs))
-
-def compute_features(closes, volumes):
-    ema_fast = get_ema(closes, 12)
-    ema_slow = get_ema(closes, 26)
-    rsi = get_rsi(closes)
-
-    min_len = min(len(ema_fast), len(ema_slow), len(rsi), len(volumes))
-    if min_len == 0:
-        raise ValueError("Not enough data for feature computation.")
-
-    ema_fast = ema_fast[-min_len:]
-    ema_slow = ema_slow[-min_len:]
-    rsi = rsi[-min_len:]
-    volumes = volumes[-min_len:]
-
-    return np.column_stack([ema_fast, ema_slow, rsi, volumes])
-
-# =================== MODEL TRAINING ===================
-def train_ml_model(symbol, closes, volumes):
-    try:
-        X = compute_features(closes, volumes)
-        y = np.where(np.diff(closes[-len(X)-1:]) > 0, 1, 0)
-        y = y[-len(X):]
-
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-        model = XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, n_jobs=1)
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-
-        joblib.dump(model, f"{MODEL_PATH}/{symbol}.pkl")
-        model_cache[symbol] = model
-        last_trained[symbol] = datetime.utcnow()
-        print(f"✅ {symbol} model trained. Accuracy: {acc:.2f}")
-        return model
-    except Exception as e:
-        print(f"Training failed for {symbol}: {e}")
-        return None
-
-def load_model(symbol):
-    path = f"{MODEL_PATH}/{symbol}.pkl"
-    if os.path.exists(path):
-        model = joblib.load(path)
-        model_cache[symbol] = model
-        return model
-    return None
-
-# =================== PREDICTION ===================
-def predict_signal(model, closes, volumes):
-    X = compute_features(closes, volumes)
-    X_latest = X[-1].reshape(1, -1)
-    prob = model.predict_proba(X_latest)[0][1]
-    return prob
-
-# =================== FEEDBACK SYSTEM ===================
-def log_prediction(symbol, direction, price, prob):
-    prediction_log.append({
-        "symbol": symbol,
-        "timestamp": datetime.utcnow().isoformat(),
-        "direction": direction,
-        "price": price,
-        "prob": prob,
-        "checked": False
-    })
-    save_json(PRED_LOG_PATH, prediction_log)
-
-def evaluate_feedback():
-    now = datetime.utcnow()
-    new_feedbacks = 0
-
-    for pred in prediction_log:
-        if pred["checked"]:
-            continue
-
-        pred_time = datetime.fromisoformat(pred["timestamp"])
-        if (now - pred_time) < timedelta(minutes=15):  # wait 3 candles (5m each)
-            continue
-
-        closes, _ = fetch_candles(pred["symbol"], limit=5)
-        if len(closes) == 0:
-            continue
-
-        current_price = closes[-1]
-        change_pct = ((current_price - pred["price"]) / pred["price"]) * 100
-
-        correct = (
-            (pred["direction"] == "bullish" and change_pct >= 10) or
-            (pred["direction"] == "bearish" and change_pct <= -10)
-        )
-
-        feedback_log.append({
-            "symbol": pred["symbol"],
-            "timestamp": pred["timestamp"],
-            "direction": pred["direction"],
-            "price_change_pct": round(change_pct, 2),
-            "outcome": "correct" if correct else "wrong"
-        })
-
-        pred["checked"] = True
-        new_feedbacks += 1
-
-    if new_feedbacks > 0:
-        save_json(FEED_LOG_PATH, feedback_log)
-        save_json(PRED_LOG_PATH, prediction_log)
-        print(f"✅ Evaluated {new_feedbacks} past predictions.")
-# def evaluate_feedback():
-#     now = datetime.utcnow()
-#     new_feedbacks = 0
-
-#     for pred in prediction_log:
-#         if pred.get("checked"):
-#             continue
-
-#         pred_time = datetime.fromisoformat(pred["timestamp"])
-#         if (now - pred_time) < timedelta(minutes=15):  # wait 3 candles (5m each)
-#             continue
-
-#         closes, _ = fetch_candles(pred["symbol"], limit=5)
-#         if len(closes) == 0:
-#             continue
-
-#         current_price = closes[-1]
-#         change_pct = ((current_price - pred["price"]) / pred["price"]) * 100
-
-#         # Determine if signal was correct
-#         correct = (
-#             (pred["direction"] == "bullish" and change_pct >= 10) or
-#             (pred["direction"] == "bearish" and change_pct <= -10)
-#         )
-
-#         outcome = "correct" if correct else "wrong"
-#         reason = ""
-
-#         if correct and pred["direction"] == "bullish":
-#             reason = f"✅ Bullish call was correct — price rose {change_pct:.2f}% in 15m."
-#         elif correct and pred["direction"] == "bearish":
-#             reason = f"✅ Bearish call was correct — price dropped {abs(change_pct):.2f}% in 15m."
-#         elif not correct and pred["direction"] == "bullish":
-#             reason = f"❌ Bullish call was wrong — price actually fell {abs(change_pct):.2f}%."
-#         elif not correct and pred["direction"] == "bearish":
-#             reason = f"❌ Bearish call was wrong — price actually rose {abs(change_pct):.2f}%."
-
-#         # Record feedback
-#         feedback_log.append({
-#             "symbol": pred["symbol"],
-#             "timestamp": pred["timestamp"],
-#             "direction": pred["direction"],
-#             "price_change_pct": round(change_pct, 2),
-#             "outcome": outcome,
-#             "reason": reason
-#         })
-
-#         # Send result message to users
-#         msg = (
-#             f"📈 *Signal Review*\n"
-#             f"Symbol: *{pred['symbol']}*\n"
-#             f"Direction: {pred['direction'].capitalize()}\n"
-#             f"Result: {'✅ Correct' if correct else '❌ Wrong'}\n"
-#             f"{reason}\n"
-#             f"⏰ Checked at {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-#         )
-#         for uid in user_ids:
-#             send_telegram(uid, msg)
-
-#         pred["checked"] = True
-#         new_feedbacks += 1
-
-#     if new_feedbacks > 0:
-#         save_json(FEED_LOG_PATH, feedback_log)
-#         save_json(PRED_LOG_PATH, prediction_log)
-#         print(f"✅ Evaluated {new_feedbacks} past predictions and sent results.")
-
-
-def recent_accuracy(symbol, window=10):
-    data = [f for f in feedback_log if f["symbol"] == symbol][-window:]
-    if not data:
-        return 0.5
-    correct = sum(1 for f in data if f["outcome"] == "correct")
-    return correct / len(data)
-
-def retrain_with_feedback(symbol):
-    acc = recent_accuracy(symbol)
-    if acc < 0.4:
-        print(f"⚠️ Skipping retrain for {symbol}: poor performance ({acc:.2f})")
+# ---------------- Telegram ----------------
+def send_telegram(chat_id, msg):
+    if not BOT_TOKEN:
+        print("BOT_TOKEN not set — would send:", msg)
         return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": chat_id, "text": msg}, timeout=5)
+    except Exception as e:
+        print("Telegram send error:", e)
 
-    closes, volumes = fetch_candles(symbol)
-    if len(closes) > 50:
-        train_ml_model(symbol, closes, volumes)
+def broadcast(msg):
+    for uid in list(user_ids):
+        send_telegram(uid, msg)
 
-# =================== MONITOR ===================
-async def monitor_learning():
-    await asyncio.sleep(10)
-    while True:
-        for symbol in SYMBOLS:
-            closes, volumes = fetch_candles(symbol)
-            if len(closes) < 50:
-                continue
+# ---------------- Indicators ----------------
+def get_ema(values, period):
+    if len(values) < period or period < 1:
+        return None
+    weights = np.exp(np.linspace(-1., 0., period))
+    weights /= weights.sum()
+    ema = np.convolve(values, weights, mode="valid")
+    return float(np.round(ema[-1], 8))
 
-            model = model_cache.get(symbol) or load_model(symbol)
-            if model is None or (symbol not in last_trained or datetime.utcnow() - last_trained[symbol] > timedelta(hours=4)):
-                model = train_ml_model(symbol, closes, volumes)
+def get_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    deltas = np.diff(closes)
+    ups = deltas.clip(min=0)
+    downs = -deltas.clip(max=0)
+    roll_up = np.mean(ups[-period:])
+    roll_down = np.mean(downs[-period:])
+    if roll_down == 0:
+        return 100
+    rs = roll_up / roll_down
+    return round(100 - (100 / (1 + rs)), 2)
 
-            if model is None:
-                continue
+def get_macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow + signal:
+        return None, None, None
+    ema_fast = get_ema(closes, fast)
+    ema_slow = get_ema(closes, slow)
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+    macd_line = ema_fast - ema_slow
+    macd_series = []
+    for i in range(slow, len(closes)):
+        fast_i = get_ema(closes[:i+1], fast)
+        slow_i = get_ema(closes[:i+1], slow)
+        if fast_i is None or slow_i is None:
+            continue
+        macd_series.append(fast_i - slow_i)
+    if len(macd_series) < signal:
+        signal_line = None
+    else:
+        signal_line = get_ema(macd_series, signal)
+    macd_hist = macd_line - signal_line if signal_line is not None else 0
+    return round(macd_line, 5), round(signal_line, 5) if signal_line else None, round(macd_hist, 5)
 
-            prob = predict_signal(model, closes, volumes)
-            price = closes[-1]
-            acc = recent_accuracy(symbol)
+def compute_features(closes, volumes=None):
+    ema9 = get_ema(closes, 9)
+    ema26 = get_ema(closes, 26)
+    rsi14 = get_rsi(closes, 14)
+    macd_line, macd_signal, macd_hist = get_macd(closes)
+    last_volume = volumes[-1] if volumes else 0
+    return [ema9, ema26, rsi14, macd_line, macd_signal, macd_hist, last_volume]
 
-            # Smart alert logic
-            if prob > 0.7 and acc > 0.6:
-                direction = "bullish"
-                msg = (
-                    f"📊 *{symbol}*\n"
-                    f"Trend: 📈 Bullish\n"
-                    f"Probability: {prob*100:.2f}%\n"
-                    f"Recent accuracy: {acc*100:.2f}%\n"
-                    f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-                )
-                for uid in user_ids:
-                    send_telegram(uid, msg)
-                log_prediction(symbol, direction, price, prob)
+# ---------------- Binance ----------------
+def fetch_klines(symbol, interval, limit=200):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[REST] Error fetching klines {symbol} {interval}: {e}")
+        return []
 
-            elif prob < 0.3 and acc > 0.6:
-                direction = "bearish"
-                msg = (
-                    f"📊 *{symbol}*\n"
-                    f"Trend: 📉 Bearish\n"
-                    f"Probability: {(1-prob)*100:.2f}%\n"
-                    f"Recent accuracy: {acc*100:.2f}%\n"
-                    f"⏰ {datetime.utcnow().strftime('%H:%M:%S UTC')}"
-                )
-                for uid in user_ids:
-                    send_telegram(uid, msg)
-                log_prediction(symbol, direction, price, prob)
-
-            await asyncio.sleep(2)
-
-        evaluate_feedback()
-
-        # Retrain after every 20 feedback records
-        if len(feedback_log) % 20 == 0 and len(feedback_log) > 0:
-            for sym in SYMBOLS:
-                retrain_with_feedback(sym)
-
-        await asyncio.sleep(300)
-
-# =================== TELEGRAM WEBHOOK ===================
+# ---------------- Telegram Webhook ----------------
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
     if token != BOT_TOKEN:
@@ -520,14 +293,147 @@ async def telegram_webhook(token: str, request: Request):
         text = data["message"].get("text", "")
         if chat_id not in user_ids:
             user_ids.add(chat_id)
-            send_telegram(chat_id, f"✅ Subscribed to AI EMA alerts!\nTracking: {', '.join(SYMBOLS)}")
+            send_telegram(chat_id, f"✅ Subscribed to EMA alerts!\nTracking: {', '.join(SYMBOLS)}")
         if text.lower() == "/start":
-            send_telegram(chat_id, "👋 Welcome! AI learning alerts active.")
+            send_telegram(chat_id, "👋 Welcome! EMA + AI alerts are active.")
     return {"ok": True}
 
-# =================== STARTUP ===================
+# ---------------- ML Model ----------------
+def model_path(symbol):
+    return os.path.join(MODEL_DIR, f"{symbol}_xgb.json")
+
+def load_model(symbol):
+    path = model_path(symbol)
+    if os.path.exists(path):
+        model = xgb.XGBClassifier()
+        model.load_model(path)
+        return model
+    return None
+
+def save_model(model, symbol):
+    model.save_model(model_path(symbol))
+
+def train_ml_model(symbol, closes, volumes=None):
+    X, y = [], []
+    for i in range(50, len(closes)-1):  # use more candles for better accuracy
+        feats = compute_features(closes[:i], volumes[:i] if volumes else None)
+        if None in feats:
+            continue
+        X.append(feats)
+        y.append(1 if closes[i+1] > closes[i] else 0)
+    if len(X) < 40:
+        return None
+    model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss')
+    model.fit(np.array(X), np.array(y))
+    save_model(model, symbol)
+    return model
+
+def predict_trend(model, closes, volumes=None):
+    feats = compute_features(closes, volumes)
+    if None in feats:
+        return None
+    return model.predict_proba([feats])[0][1] if model else None
+
+# ---------------- EMA Monitor ----------------
+async def monitor_ema(symbol, interval):
+    klines = fetch_klines(symbol, interval, limit=300)
+    closes = [float(k[4]) for k in klines]
+    volumes = [float(k[5]) for k in klines]
+    model = load_model(symbol)
+    if not model:
+        model = train_ml_model(symbol, closes, volumes)
+
+    prev_ema9 = get_ema(closes, 9)
+    prev_ema26 = get_ema(closes, 26)
+
+    while True:
+        await asyncio.sleep(5)
+        klines_new = fetch_klines(symbol, interval, limit=2)
+        if not klines_new:
+            continue
+        close_price = float(klines_new[-1][4])
+        closes.append(close_price)
+        volumes.append(float(klines_new[-1][5]))
+        ema9 = get_ema(closes, 9)
+        ema26 = get_ema(closes, 26)
+        if None in [prev_ema9, prev_ema26, ema9, ema26]:
+            prev_ema9, prev_ema26 = ema9, ema26
+            continue
+
+        prob = predict_trend(model, closes, volumes)
+
+        if interval == "15m":
+            print(f"[LOG] {symbol} 15m checked — Prob: {round(prob*100,2) if prob else '?'}%")
+        else:
+            if prev_ema9 < prev_ema26 and ema9 >= ema26:
+                if prob and prob * 100 >= 60:
+                    msg = f"📈 {symbol} ({interval}) EMA9 crossed ABOVE EMA26 — BUY 💰\nPrice: {close_price}"
+                    msg += f"\n🤖 Uptrend Probability: {round(prob*100,2)}%"
+                    broadcast(msg)
+                    open_signals[symbol] = {"type": "buy", "price": close_price, "candle_count": 0, "time": datetime.utcnow()}
+            elif prev_ema9 > prev_ema26 and ema9 <= ema26:
+                if prob and (1 - prob) * 100 >= 60:
+                    msg = f"📉 {symbol} ({interval}) EMA9 crossed BELOW EMA26 — SELL ⚠️\nPrice: {close_price}"
+                    msg += f"\n🤖 Downtrend Probability: {round((1-prob)*100,2)}%"
+                    broadcast(msg)
+                    open_signals[symbol] = {"type": "sell", "price": close_price, "candle_count": 0, "time": datetime.utcnow()}
+
+        # Accuracy check for open signals
+        for sym, sig in list(open_signals.items()):
+            sig["candle_count"] += 1
+            if sig["candle_count"] >= 5:
+                new_price = closes[-1]
+                change = (new_price - sig["price"]) / sig["price"] * 100
+                if sig["type"] == "sell":
+                    change = -change
+                profit = change * 20  # 20x leverage
+                result = "✅ PROFIT" if profit > 10 else "❌ LOSS"
+                msg = f"📊 Accuracy Check: {sym}\n{result}\nProfit: {round(profit,2)}%\nChecked after 5 candles\n🕒 {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                broadcast(msg)
+                print(msg)
+                open_signals.pop(sym)
+                model = train_ml_model(sym, closes, volumes)
+
+        prev_ema9, prev_ema26 = ema9, ema26
+
+# ---------------- Hourly Close Alerts ----------------
+async def monitor_hourly():
+    while True:
+        now = datetime.now(timezone.utc)
+        next_hour = (now.replace(minute=0, second=5, microsecond=0) + timedelta(hours=1))
+        await asyncio.sleep((next_hour - now).total_seconds())
+        for symbol in SYMBOLS:
+            klines = fetch_klines(symbol, "1h", limit=2)
+            if not klines:
+                continue
+            last = klines[-1]
+            close_time_ms = int(last[6])
+            key = (symbol, "1h", close_time_ms)
+            if key in sent_hourly:
+                continue
+            close_price = float(last[4])
+            ts = datetime.fromtimestamp(close_time_ms / 1000, tz=timezone.utc)
+            msg = f"🕐 {symbol} 1H Close ({ts.strftime('%Y-%m-%d %H:%M UTC')})\nClose: {close_price}"
+            broadcast(msg)
+            sent_hourly.add(key)
+
+# ---------------- 4-Hour Retraining ----------------
+async def retrain_loop():
+    while True:
+        await asyncio.sleep(4 * 60 * 60)
+        for symbol in SYMBOLS:
+            klines = fetch_klines(symbol, "5m", limit=300)
+            closes = [float(k[4]) for k in klines]
+            volumes = [float(k[5]) for k in klines]
+            model = train_ml_model(symbol, closes, volumes)
+            if model:
+                print(f"[RETRAIN] Model for {symbol} updated at {datetime.now()}")
+
+# ---------------- Startup ----------------
 @app.on_event("startup")
 async def startup_event():
-    for sym in SYMBOLS:
-        load_model(sym)
-    asyncio.create_task(monitor_learning())
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES:
+            asyncio.create_task(monitor_ema(symbol, tf))
+    asyncio.create_task(monitor_hourly())
+    asyncio.create_task(retrain_loop())
