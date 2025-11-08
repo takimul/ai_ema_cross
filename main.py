@@ -740,7 +740,7 @@ from collections import deque
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SYMBOLS = ["OPUSDT", "RENDERUSDT", "ONDOUSDT"]
-TIMEFRAMES = ["5m", "15m"]  # frequent signals
+TIMEFRAMES = ["1m", "5m"]  # frequent signals
 MODEL_DIR = "models"
 HISTORY_FILE = os.path.join(MODEL_DIR, "signal_history.json")
 os.makedirs(MODEL_DIR, exist_ok=True)
