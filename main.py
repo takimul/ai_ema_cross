@@ -727,6 +727,353 @@
 
 # train when actual loss
 # main.py
+# import os
+# import json
+# import requests
+# import asyncio
+# import numpy as np
+# from datetime import datetime, timezone
+# from fastapi import FastAPI, Request
+# import xgboost as xgb
+# from collections import deque
+
+# # ---------------- CONFIG ----------------
+# BOT_TOKEN = os.getenv("BOT_TOKEN")
+# SYMBOLS = ["OPUSDT", "RENDERUSDT", "ONDOUSDT"]
+# TIMEFRAMES = ["1m", "5m"]  # frequent signals
+# MODEL_DIR = "models"
+# HISTORY_FILE = os.path.join(MODEL_DIR, "signal_history.json")
+# os.makedirs(MODEL_DIR, exist_ok=True)
+
+# LEVERAGE = 20
+# TARGET_ACCOUNT_PROFIT_PCT = 10.0  # target profit at 20x
+# MAX_CANDLES_TO_CHECK = 5
+# MAX_HISTORY = 10  # last 10 results per symbol
+
+# app = FastAPI()
+# user_ids = set()
+# active_signals = []  # active signals with tracking
+# signal_history = {sym: deque(maxlen=MAX_HISTORY) for sym in SYMBOLS}
+
+
+# # ---------------- UTILITIES ----------------
+# def now_utc():
+#     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# def save_signal_history():
+#     data = {s: list(dq) for s, dq in signal_history.items()}
+#     with open(HISTORY_FILE, "w") as f:
+#         json.dump(data, f)
+
+
+# def load_signal_history():
+#     if os.path.exists(HISTORY_FILE):
+#         try:
+#             with open(HISTORY_FILE, "r") as f:
+#                 data = json.load(f)
+#             for s, vals in data.items():
+#                 if s in signal_history:
+#                     signal_history[s].extend(vals)
+#             print(f"[LOAD] Signal history loaded: {data}")
+#         except Exception as e:
+#             print("[WARN] Failed to load signal history:", e)
+
+
+# # ---------------- TELEGRAM ----------------
+# def send_telegram(chat_id, msg):
+#     if not BOT_TOKEN:
+#         print("BOT_TOKEN not set — would send:", msg)
+#         return
+#     try:
+#         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+#         requests.post(url, data={"chat_id": chat_id, "text": msg}, timeout=5)
+#     except Exception as e:
+#         print("Telegram send error:", e)
+
+
+# def broadcast(msg):
+#     for uid in list(user_ids):
+#         send_telegram(uid, msg)
+
+
+# # ---------------- INDICATORS ----------------
+# def get_ema(values, period):
+#     if len(values) < period or period < 1:
+#         return None
+#     weights = np.exp(np.linspace(-1., 0., period))
+#     weights /= weights.sum()
+#     ema = np.convolve(values, weights, mode="valid")
+#     return float(np.round(ema[-1], 8))
+
+
+# def get_rsi(closes, period=14):
+#     if len(closes) < period + 1:
+#         return None
+#     deltas = np.diff(closes)
+#     ups = deltas.clip(min=0)
+#     downs = -deltas.clip(max=0)
+#     roll_up = np.mean(ups[-period:])
+#     roll_down = np.mean(downs[-period:])
+#     if roll_down == 0:
+#         return 100
+#     rs = roll_up / roll_down
+#     return round(100 - (100 / (1 + rs)), 2)
+
+
+# def get_macd(closes, fast=12, slow=26, signal=9):
+#     if len(closes) < slow + signal:
+#         return None, None, None
+#     ema_fast = get_ema(closes, fast)
+#     ema_slow = get_ema(closes, slow)
+#     if ema_fast is None or ema_slow is None:
+#         return None, None, None
+#     macd_line = ema_fast - ema_slow
+#     macd_series = []
+#     for i in range(slow, len(closes)):
+#         fast_i = get_ema(closes[:i + 1], fast)
+#         slow_i = get_ema(closes[:i + 1], slow)
+#         if fast_i is None or slow_i is None:
+#             continue
+#         macd_series.append(fast_i - slow_i)
+#     if len(macd_series) < signal:
+#         signal_line = None
+#     else:
+#         signal_line = get_ema(macd_series, signal)
+#     macd_hist = macd_line - signal_line if signal_line is not None else 0
+#     return round(macd_line, 5), round(signal_line, 5) if signal_line else None, round(macd_hist, 5)
+
+
+# def compute_features(closes, volumes=None):
+#     ema9 = get_ema(closes, 9)
+#     ema26 = get_ema(closes, 26)
+#     rsi14 = get_rsi(closes, 14)
+#     macd_line, macd_signal, macd_hist = get_macd(closes)
+#     last_volume = volumes[-1] if volumes else 0
+#     return [ema9, ema26, rsi14, macd_line, macd_signal, macd_hist, last_volume]
+
+
+# # ---------------- BINANCE ----------------
+# def fetch_klines(symbol, interval, limit=200):
+#     url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+#     try:
+#         r = requests.get(url, timeout=10)
+#         r.raise_for_status()
+#         return r.json()
+#     except Exception as e:
+#         print(f"[REST] Error fetching klines {symbol} {interval}: {e}")
+#         return []
+
+
+# # ---------------- TELEGRAM WEBHOOK ----------------
+# @app.post("/webhook/{token}")
+# async def telegram_webhook(token: str, request: Request):
+#     if token != BOT_TOKEN:
+#         return {"ok": False}
+#     data = await request.json()
+#     if "message" in data:
+#         chat_id = data["message"]["chat"]["id"]
+#         text = data["message"].get("text", "")
+#         if chat_id not in user_ids:
+#             user_ids.add(chat_id)
+#             send_telegram(chat_id, f"✅ Subscribed to EMA alerts!\nTracking: {', '.join(SYMBOLS)}")
+#         if text.lower() == "/start":
+#             send_telegram(chat_id, "👋 Welcome! EMA + AI alerts are active.")
+#     return {"ok": True}
+
+
+# # ---------------- MACHINE LEARNING ----------------
+# def model_path(symbol):
+#     return os.path.join(MODEL_DIR, f"{symbol}_xgb.json")
+
+
+# def load_model(symbol):
+#     path = model_path(symbol)
+#     if os.path.exists(path):
+#         model = xgb.XGBClassifier()
+#         model.load_model(path)
+#         return model
+#     return None
+
+
+# def save_model(model, symbol):
+#     model.save_model(model_path(symbol))
+
+
+# def train_ml_model(symbol, closes, volumes=None):
+#     X, y = [], []
+#     for i in range(30, len(closes) - 1):
+#         feats = compute_features(closes[:i], volumes[:i] if volumes else None)
+#         if None in feats:
+#             continue
+#         X.append(feats)
+#         y.append(1 if closes[i + 1] > closes[i] else 0)
+#     if len(X) < 20:
+#         return None
+#     model = xgb.XGBClassifier(eval_metric='logloss')
+#     model.fit(np.array(X), np.array(y))
+#     save_model(model, symbol)
+#     print(f"[ML] trained & saved model for {symbol} (samples={len(X)})")
+#     return model
+
+
+# def predict_trend(model, closes, volumes=None):
+#     feats = compute_features(closes, volumes)
+#     if None in feats:
+#         return None
+#     return model.predict_proba([feats])[0][1] if model else None
+
+
+# # ---------------- EMA MONITOR ----------------
+# async def monitor_ema(symbol, interval):
+#     print(f"[MON] starting {symbol} {interval}")
+#     klines = fetch_klines(symbol, interval, limit=200)
+#     closes = [float(k[4]) for k in klines]
+#     volumes = [float(k[5]) for k in klines]
+
+#     model = load_model(symbol)
+#     if not model:
+#         model = train_ml_model(symbol, closes, volumes)
+
+#     prev_ema9 = get_ema(closes, 9)
+#     prev_ema26 = get_ema(closes, 26)
+
+#     while True:
+#         await asyncio.sleep(5)
+#         klines_new = fetch_klines(symbol, interval, limit=2)
+#         if not klines_new:
+#             continue
+#         close_price = float(klines_new[-1][4])
+#         closes.append(close_price)
+#         volumes.append(float(klines_new[-1][5]))
+#         ema9 = get_ema(closes, 9)
+#         ema26 = get_ema(closes, 26)
+#         if None in [prev_ema9, prev_ema26, ema9, ema26]:
+#             prev_ema9, prev_ema26 = ema9, ema26
+#             continue
+
+#         prob = predict_trend(model, closes, volumes)
+#         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+#         print(f"[{symbol} {interval}] EMA9={ema9:.4f} EMA26={ema26:.4f} prob={prob}")
+
+#         avg_profit = np.mean(signal_history[symbol]) if signal_history[symbol] else 0
+#         can_send = (not signal_history[symbol]) or (avg_profit >= 0)
+
+#         # CROSS UP
+#         if prev_ema9 < prev_ema26 and ema9 >= ema26 and can_send:
+#             if prob and prob * 100 >= 55:
+#                 msg = (
+#                     f"📈 {symbol} ({interval}) EMA9 crossed ABOVE EMA26 — BUY 💰\n"
+#                     f"Price: {close_price}\n🤖 Uptrend Probability: {round(prob * 100, 2)}%\n🕒 {now_str}"
+#                 )
+#                 broadcast(msg)
+#                 active_signals.append({
+#                     "symbol": symbol,
+#                     "interval": interval,
+#                     "direction": "up",
+#                     "entry_price": close_price,
+#                     "signal_time": now_str,
+#                     "model_conf": round(prob * 100, 2),
+#                     "checked_candles": 0,
+#                     "max_profit": 0.0,
+#                     "profit": 0.0
+#                 })
+
+#         # CROSS DOWN
+#         elif prev_ema9 > prev_ema26 and ema9 <= ema26 and can_send:
+#             if prob and (1 - prob) * 100 >= 55:
+#                 msg = (
+#                     f"📉 {symbol} ({interval}) EMA9 crossed BELOW EMA26 — SELL ⚠️\n"
+#                     f"Price: {close_price}\n🤖 Downtrend Probability: {round((1 - prob) * 100, 2)}%\n🕒 {now_str}"
+#                 )
+#                 broadcast(msg)
+#                 active_signals.append({
+#                     "symbol": symbol,
+#                     "interval": interval,
+#                     "direction": "down",
+#                     "entry_price": close_price,
+#                     "signal_time": now_str,
+#                     "model_conf": round((1 - prob) * 100, 2),
+#                     "checked_candles": 0,
+#                     "max_profit": 0.0,
+#                     "profit": 0.0
+#                 })
+
+#         prev_ema9, prev_ema26 = ema9, ema26
+
+
+# # ---------------- PROFIT EVALUATOR ----------------
+# async def profit_evaluator_loop():
+#     while True:
+#         await asyncio.sleep(60)
+#         to_remove = []
+#         for ev in list(active_signals):
+#             symbol = ev["symbol"]
+#             interval = ev["interval"]
+#             direction = ev["direction"]
+#             entry_price = ev["entry_price"]
+#             ev["checked_candles"] += 1
+
+#             klines = fetch_klines(symbol, interval, limit=2)
+#             if not klines:
+#                 continue
+#             current_price = float(klines[-1][4])
+
+#             if direction == "up":
+#                 decimal_move = (current_price - entry_price) / entry_price
+#             else:
+#                 decimal_move = (entry_price - current_price) / entry_price
+
+#             account_profit_pct = decimal_move * LEVERAGE * 100
+#             ev["profit"] = account_profit_pct
+#             ev["max_profit"] = max(ev["max_profit"], account_profit_pct)
+
+#             profit_hit = ev["max_profit"] >= TARGET_ACCOUNT_PROFIT_PCT
+#             is_final = ev["checked_candles"] >= MAX_CANDLES_TO_CHECK
+
+#             if profit_hit or is_final:
+#                 status = "✅ PROFIT" if ev["max_profit"] >= 0 else "❌ LOSS"
+#                 msg = (
+#                     f"📊 Accuracy Check: {symbol} ({interval})\n"
+#                     f"{status}\n"
+#                     f"Entry: {entry_price} | Now: {current_price}\n"
+#                     f"Max Profit: {round(ev['max_profit'], 2)}%\n"
+#                     f"Checked after {ev['checked_candles']} candles\n"
+#                     f"Signal Time: {ev['signal_time']}\n"
+#                     f"🧠 Model Confidence: {ev['model_conf']}%"
+#                 )
+#                 broadcast(msg)
+#                 signal_history[symbol].append(ev["max_profit"])
+#                 save_signal_history()
+
+#                 if ev["max_profit"] < 0:
+#                     klines_all = fetch_klines(symbol, "5m", limit=400)
+#                     closes = [float(k[4]) for k in klines_all]
+#                     volumes = [float(k[5]) for k in klines_all]
+#                     model = train_ml_model(symbol, closes, volumes)
+#                     if model:
+#                         print(f"[RETRAIN] Model updated for {symbol} (loss correction)")
+#                 to_remove.append(ev)
+
+#         for ev in to_remove:
+#             active_signals.remove(ev)
+
+
+# # ---------------- STARTUP ----------------
+# @app.on_event("startup")
+# async def startup_event():
+#     load_signal_history()
+#     print(f"✅ EMA+AI service started at {now_utc()}")
+#     for symbol in SYMBOLS:
+#         for tf in TIMEFRAMES:
+#             asyncio.create_task(monitor_ema(symbol, tf))
+#     asyncio.create_task(profit_evaluator_loop())
+
+
+# # ---------------- RUN ----------------
+# # Run with: uvicorn main:app --host 0.0.0.0 --port 8080
+
+# for max profit accuracy
 import os
 import json
 import requests
@@ -736,23 +1083,27 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Request
 import xgboost as xgb
 from collections import deque
+import matplotlib.pyplot as plt
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SYMBOLS = ["OPUSDT", "RENDERUSDT", "ONDOUSDT"]
-TIMEFRAMES = ["1m", "5m"]  # frequent signals
+TIMEFRAMES = ["1m", "5m"]
 MODEL_DIR = "models"
 HISTORY_FILE = os.path.join(MODEL_DIR, "signal_history.json")
+LIVE_TRAIN_FILE = os.path.join(MODEL_DIR, "live_training.json")
+PLOT_FILE = os.path.join(MODEL_DIR, "performance.png")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 LEVERAGE = 20
-TARGET_ACCOUNT_PROFIT_PCT = 10.0  # target profit at 20x
+TARGET_ACCOUNT_PROFIT_PCT = 10.0
 MAX_CANDLES_TO_CHECK = 5
-MAX_HISTORY = 10  # last 10 results per symbol
+MAX_HISTORY = 10
+PLOT_UPDATE_INTERVAL = 1800  # 30 min
 
 app = FastAPI()
 user_ids = set()
-active_signals = []  # active signals with tracking
+active_signals = []
 signal_history = {sym: deque(maxlen=MAX_HISTORY) for sym in SYMBOLS}
 
 
@@ -792,9 +1143,27 @@ def send_telegram(chat_id, msg):
         print("Telegram send error:", e)
 
 
+def send_telegram_photo(chat_id, photo_path, caption=None):
+    if not BOT_TOKEN or not os.path.exists(photo_path):
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            data = {"chat_id": chat_id, "caption": caption or ""}
+            requests.post(url, data=data, files=files, timeout=10)
+    except Exception as e:
+        print("Telegram photo send error:", e)
+
+
 def broadcast(msg):
     for uid in list(user_ids):
         send_telegram(uid, msg)
+
+
+def broadcast_photo(photo_path, caption=None):
+    for uid in list(user_ids):
+        send_telegram_photo(uid, photo_path, caption)
 
 
 # ---------------- INDICATORS ----------------
@@ -878,7 +1247,7 @@ async def telegram_webhook(token: str, request: Request):
             user_ids.add(chat_id)
             send_telegram(chat_id, f"✅ Subscribed to EMA alerts!\nTracking: {', '.join(SYMBOLS)}")
         if text.lower() == "/start":
-            send_telegram(chat_id, "👋 Welcome! EMA + AI alerts are active.")
+            send_telegram(chat_id, "👋 Welcome! EMA + AI adaptive alerts are active.")
     return {"ok": True}
 
 
@@ -924,17 +1293,77 @@ def predict_trend(model, closes, volumes=None):
     return model.predict_proba([feats])[0][1] if model else None
 
 
+# ---------------- LIVE LEARNING ----------------
+def record_live_example(symbol, closes, volumes, profit):
+    feats = compute_features(closes, volumes)
+    if None in feats:
+        return
+    data = []
+    if os.path.exists(LIVE_TRAIN_FILE):
+        try:
+            with open(LIVE_TRAIN_FILE, "r") as f:
+                data = json.load(f)
+        except:
+            pass
+    data.append({"symbol": symbol, "features": feats, "profit": profit})
+    data = data[-2000:]
+    with open(LIVE_TRAIN_FILE, "w") as f:
+        json.dump(data, f)
+    print(f"[LIVE DATA] Recorded training sample for {symbol} (profit={profit:.2f}%)")
+
+
+def retrain_from_live_data(symbol):
+    if not os.path.exists(LIVE_TRAIN_FILE):
+        return None
+    with open(LIVE_TRAIN_FILE, "r") as f:
+        data = json.load(f)
+    data = [d for d in data if d["symbol"] == symbol]
+    if len(data) < 30:
+        return None
+    X = [d["features"] for d in data if None not in d["features"]]
+    y = [1 if d["profit"] > 0 else 0 for d in data]
+    if len(X) < 30:
+        return None
+    model = xgb.XGBClassifier(eval_metric="logloss")
+    model.fit(np.array(X), np.array(y))
+    save_model(model, symbol)
+    print(f"[LIVE RETRAIN] Updated model from live data ({len(X)} samples) for {symbol}")
+    return model
+
+
+# ---------------- VISUALIZATION ----------------
+def plot_performance():
+    """Create and save performance chart with summary caption."""
+    try:
+        plt.figure(figsize=(6, 3))
+        summary_lines = []
+        for sym, vals in signal_history.items():
+            if vals:
+                plt.plot(vals, label=sym)
+                avg = np.mean(vals)
+                wins = sum(1 for v in vals if v > 0)
+                acc = wins / len(vals) * 100
+                summary_lines.append(f"{sym}: {avg:.1f}% avg, {acc:.1f}% win")
+        plt.title("Recent Signal Profit (%)")
+        plt.xlabel("Signal #")
+        plt.ylabel("Profit % (leveraged)")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(PLOT_FILE)
+        caption = "📊 Latest Signal Performance\n" + "\n".join(summary_lines)
+        broadcast_photo(PLOT_FILE, caption)
+        print(f"[PLOT] Performance chart saved and sent.")
+    except Exception as e:
+        print("[PLOT ERROR]", e)
+
+
 # ---------------- EMA MONITOR ----------------
 async def monitor_ema(symbol, interval):
     print(f"[MON] starting {symbol} {interval}")
     klines = fetch_klines(symbol, interval, limit=200)
     closes = [float(k[4]) for k in klines]
     volumes = [float(k[5]) for k in klines]
-
-    model = load_model(symbol)
-    if not model:
-        model = train_ml_model(symbol, closes, volumes)
-
+    model = load_model(symbol) or train_ml_model(symbol, closes, volumes)
     prev_ema9 = get_ema(closes, 9)
     prev_ema26 = get_ema(closes, 26)
 
@@ -951,54 +1380,41 @@ async def monitor_ema(symbol, interval):
         if None in [prev_ema9, prev_ema26, ema9, ema26]:
             prev_ema9, prev_ema26 = ema9, ema26
             continue
-
         prob = predict_trend(model, closes, volumes)
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        print(f"[{symbol} {interval}] EMA9={ema9:.4f} EMA26={ema26:.4f} prob={prob}")
 
         avg_profit = np.mean(signal_history[symbol]) if signal_history[symbol] else 0
-        can_send = (not signal_history[symbol]) or (avg_profit >= 0)
+        dynamic_threshold = 60 + min(max(avg_profit, 0), 15)
 
         # CROSS UP
-        if prev_ema9 < prev_ema26 and ema9 >= ema26 and can_send:
-            if prob and prob * 100 >= 55:
+        if prev_ema9 < prev_ema26 and ema9 >= ema26:
+            if prob and prob * 100 >= dynamic_threshold:
                 msg = (
                     f"📈 {symbol} ({interval}) EMA9 crossed ABOVE EMA26 — BUY 💰\n"
-                    f"Price: {close_price}\n🤖 Uptrend Probability: {round(prob * 100, 2)}%\n🕒 {now_str}"
+                    f"Price: {close_price}\n🤖 Uptrend Prob: {round(prob * 100, 2)}%\n🕒 {now_str}"
                 )
                 broadcast(msg)
                 active_signals.append({
-                    "symbol": symbol,
-                    "interval": interval,
-                    "direction": "up",
-                    "entry_price": close_price,
-                    "signal_time": now_str,
-                    "model_conf": round(prob * 100, 2),
-                    "checked_candles": 0,
-                    "max_profit": 0.0,
-                    "profit": 0.0
+                    "symbol": symbol, "interval": interval, "direction": "up",
+                    "entry_price": close_price, "signal_time": now_str,
+                    "model_conf": round(prob * 100, 2), "checked_candles": 0,
+                    "max_profit": 0.0, "profit": 0.0
                 })
 
         # CROSS DOWN
-        elif prev_ema9 > prev_ema26 and ema9 <= ema26 and can_send:
-            if prob and (1 - prob) * 100 >= 55:
+        elif prev_ema9 > prev_ema26 and ema9 <= ema26:
+            if prob and (1 - prob) * 100 >= dynamic_threshold:
                 msg = (
                     f"📉 {symbol} ({interval}) EMA9 crossed BELOW EMA26 — SELL ⚠️\n"
-                    f"Price: {close_price}\n🤖 Downtrend Probability: {round((1 - prob) * 100, 2)}%\n🕒 {now_str}"
+                    f"Price: {close_price}\n🤖 Downtrend Prob: {round((1 - prob) * 100, 2)}%\n🕒 {now_str}"
                 )
                 broadcast(msg)
                 active_signals.append({
-                    "symbol": symbol,
-                    "interval": interval,
-                    "direction": "down",
-                    "entry_price": close_price,
-                    "signal_time": now_str,
-                    "model_conf": round((1 - prob) * 100, 2),
-                    "checked_candles": 0,
-                    "max_profit": 0.0,
-                    "profit": 0.0
+                    "symbol": symbol, "interval": interval, "direction": "down",
+                    "entry_price": close_price, "signal_time": now_str,
+                    "model_conf": round((1 - prob) * 100, 2), "checked_candles": 0,
+                    "max_profit": 0.0, "profit": 0.0
                 })
-
         prev_ema9, prev_ema26 = ema9, ema26
 
 
@@ -1013,21 +1429,17 @@ async def profit_evaluator_loop():
             direction = ev["direction"]
             entry_price = ev["entry_price"]
             ev["checked_candles"] += 1
-
             klines = fetch_klines(symbol, interval, limit=2)
             if not klines:
                 continue
             current_price = float(klines[-1][4])
-
             if direction == "up":
                 decimal_move = (current_price - entry_price) / entry_price
             else:
                 decimal_move = (entry_price - current_price) / entry_price
-
             account_profit_pct = decimal_move * LEVERAGE * 100
             ev["profit"] = account_profit_pct
             ev["max_profit"] = max(ev["max_profit"], account_profit_pct)
-
             profit_hit = ev["max_profit"] >= TARGET_ACCOUNT_PROFIT_PCT
             is_final = ev["checked_candles"] >= MAX_CANDLES_TO_CHECK
 
@@ -1035,39 +1447,48 @@ async def profit_evaluator_loop():
                 status = "✅ PROFIT" if ev["max_profit"] >= 0 else "❌ LOSS"
                 msg = (
                     f"📊 Accuracy Check: {symbol} ({interval})\n"
-                    f"{status}\n"
-                    f"Entry: {entry_price} | Now: {current_price}\n"
-                    f"Max Profit: {round(ev['max_profit'], 2)}%\n"
-                    f"Checked after {ev['checked_candles']} candles\n"
-                    f"Signal Time: {ev['signal_time']}\n"
-                    f"🧠 Model Confidence: {ev['model_conf']}%"
+                    f"{status}\nEntry: {entry_price} | Now: {current_price}\n"
+                    f"Max Profit: {round(ev['max_profit'], 2)}%\nChecked after {ev['checked_candles']} candles\n"
+                    f"Signal Time: {ev['signal_time']}\n🧠 Model Confidence: {ev['model_conf']}%"
                 )
                 broadcast(msg)
                 signal_history[symbol].append(ev["max_profit"])
                 save_signal_history()
 
-                if ev["max_profit"] < 0:
-                    klines_all = fetch_klines(symbol, "5m", limit=400)
-                    closes = [float(k[4]) for k in klines_all]
-                    volumes = [float(k[5]) for k in klines_all]
-                    model = train_ml_model(symbol, closes, volumes)
+                klines_all = fetch_klines(symbol, "5m", limit=200)
+                closes = [float(k[4]) for k in klines_all]
+                volumes = [float(k[5]) for k in klines_all]
+                record_live_example(symbol, closes, volumes, ev["max_profit"])
+
+                if len(signal_history[symbol]) >= 3:
+                    model = retrain_from_live_data(symbol)
                     if model:
-                        print(f"[RETRAIN] Model updated for {symbol} (loss correction)")
+                        print(f"[ADAPTIVE TRAIN] {symbol} retrained from live data")
+                        plot_performance()
+
                 to_remove.append(ev)
 
         for ev in to_remove:
             active_signals.remove(ev)
 
 
+# ---------------- PLOT SCHEDULER ----------------
+async def periodic_plot_loop():
+    while True:
+        await asyncio.sleep(PLOT_UPDATE_INTERVAL)
+        plot_performance()
+
+
 # ---------------- STARTUP ----------------
 @app.on_event("startup")
 async def startup_event():
     load_signal_history()
-    print(f"✅ EMA+AI service started at {now_utc()}")
+    print(f"✅ EMA+AI self-learning service started at {now_utc()}")
     for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
             asyncio.create_task(monitor_ema(symbol, tf))
     asyncio.create_task(profit_evaluator_loop())
+    asyncio.create_task(periodic_plot_loop())
 
 
 # ---------------- RUN ----------------
