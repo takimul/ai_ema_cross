@@ -1509,7 +1509,7 @@ import matplotlib.pyplot as plt
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SYMBOLS = ["OPUSDT", "RENDERUSDT", "ONDOUSDT"]
-TIMEFRAMES = ["5m", "15m"]
+TIMEFRAMES = ["5m", "15m", "30m"]
 MODEL_DIR = "models"
 HISTORY_FILE = os.path.join(MODEL_DIR, "signal_history.json")
 LIVE_TRAIN_FILE = os.path.join(MODEL_DIR, "live_training.json")
