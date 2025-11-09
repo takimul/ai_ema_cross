@@ -6,4 +6,6 @@ scikit-learn
 xgboost
 joblib
 python-dotenv
-
+matplotlib
+python-multipart
+pydantic
