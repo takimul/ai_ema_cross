@@ -2275,7 +2275,11 @@ async def monitor_ema(symbol, interval):
 
 
 # ---------------- PROFIT EVALUATOR ----------------
+# ---------------- PROFIT EVALUATOR ----------------
 async def profit_evaluator_loop():
+    # Map timeframes to minutes per candle
+    tf_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60}
+
     while True:
         await asyncio.sleep(60)
         to_remove = []
@@ -2285,32 +2289,45 @@ async def profit_evaluator_loop():
             direction = ev["direction"]
             entry_price = ev["entry_price"]
             ev["checked_candles"] += 1
+
             klines = fetch_klines(symbol, interval, limit=2)
             if not klines:
                 continue
             current_price = float(klines[-1][4])
+
+            # Calculate PnL
             if direction == "up":
                 decimal_move = (current_price - entry_price) / entry_price
             else:
                 decimal_move = (entry_price - current_price) / entry_price
+
             account_profit_pct = decimal_move * LEVERAGE * 100
             ev["profit"] = account_profit_pct
             ev["max_profit"] = max(ev["max_profit"], account_profit_pct)
-            profit_hit = ev["max_profit"] >= TARGET_ACCOUNT_PROFIT_PCT
-            is_final = ev["checked_candles"] >= MAX_CANDLES_TO_CHECK
 
-            if profit_hit or is_final:
-                status = "✅ PROFIT" if ev["max_profit"] >= 0 else "❌ LOSS"
+            # --- Exit conditions ---
+            profit_hit = ev["max_profit"] >= TARGET_ACCOUNT_PROFIT_PCT  # ≥10%
+            loss_hit = ev["profit"] <= -5  # stop-loss trigger
+            candle_limit_reached = ev["checked_candles"] >= MAX_CANDLES_TO_CHECK
+
+            # Calculate time waited in minutes
+            wait_time = tf_minutes.get(interval, 5) * ev["checked_candles"]
+
+            # Trigger evaluation only if any condition met
+            if profit_hit or loss_hit or candle_limit_reached:
+                status = "✅ PROFIT" if ev["max_profit"] >= 10 else "❌ LOSS"
                 msg = (
                     f"📊 Accuracy Check: {symbol} ({interval})\n"
                     f"{status}\nEntry: {entry_price} | Now: {current_price}\n"
-                    f"Max Profit: {round(ev['max_profit'], 2)}%\nChecked after {ev['checked_candles']} candles\n"
+                    f"Profit: {round(ev['profit'], 2)}% | Max: {round(ev['max_profit'], 2)}%\n"
+                    f"Duration: {wait_time} mins ({ev['checked_candles']} candles)\n"
                     f"Signal Time: {ev['signal_time']}\n🧠 Model Confidence: {ev['model_conf']}%"
                 )
                 broadcast(msg)
                 signal_history[symbol].append(ev["max_profit"])
                 save_signal_history()
 
+                # Record and retrain if enough data
                 klines_all = fetch_klines(symbol, "5m", limit=200)
                 closes = [float(k[4]) for k in klines_all]
                 volumes = [float(k[5]) for k in klines_all]
@@ -2326,6 +2343,7 @@ async def profit_evaluator_loop():
 
         for ev in to_remove:
             active_signals.remove(ev)
+
 
 
 # ---------------- PLOT SCHEDULER ----------------
